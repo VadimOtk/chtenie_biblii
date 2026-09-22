@@ -13,10 +13,18 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -299,30 +307,29 @@ def split_text(text, limit=3900):
     return chunks
 
 
-def main_keyboard():
+def main_keyboard(user_id=None):
+    """Постоянная клавиатура меню внизу чата — не теряется при прокрутке, в отличие от inline-кнопок."""
     rows = []
     if WEBAPP_URL:
-        rows.append([InlineKeyboardButton(text="✨ Открыть", web_app=WebAppInfo(url=WEBAPP_URL))])
-    rows.extend([
-        [InlineKeyboardButton(text="📖 Что читаем сегодня", callback_data="today")],
-        [InlineKeyboardButton(text="💭 Моё размышление", callback_data="my_reflection")],
-        [InlineKeyboardButton(text="👥 Что думают другие", callback_data="others")],
-        [InlineKeyboardButton(text="📜 Библия — это история", callback_data="history")],
-        [InlineKeyboardButton(text="📊 Мой прогресс", callback_data="progress")],
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        rows.append([KeyboardButton(text="✨ Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))])
+    rows.append([KeyboardButton(text="📖 Сегодня"), KeyboardButton(text="💭 Моё размышление")])
+    rows.append([KeyboardButton(text="👥 Что думают другие"), KeyboardButton(text="📜 История")])
+    rows.append([KeyboardButton(text="📊 Мой прогресс")])
+    if user_id is not None and is_admin(user_id):
+        rows.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def admin_keyboard(owner=False):
+    """Постоянная клавиатура меню администратора."""
     rows = [
-        [InlineKeyboardButton(text="📖 Сегодня", callback_data="adm_today")],
-        [InlineKeyboardButton(text="🛡 Модерация", callback_data="adm_moderation")],
-        [InlineKeyboardButton(text="📜 История", callback_data="adm_history")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+        [KeyboardButton(text="📖 Управление чтением"), KeyboardButton(text="🛡 Модерация")],
+        [KeyboardButton(text="📜 Управление историей"), KeyboardButton(text="📊 Статистика бота")],
     ]
     if owner:
-        rows.append([InlineKeyboardButton(text="👑 Администраторы", callback_data="adm_admins")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        rows.append([KeyboardButton(text="👑 Администраторы")])
+    rows.append([KeyboardButton(text="⬅️ В главное меню")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def admin_menu_for(user_id):
@@ -438,6 +445,10 @@ class AdminEditReflectionState(StatesGroup):
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup=None):
+    # Telegram не позволяет прикрепить ReplyKeyboardMarkup через edit_text — только через новое сообщение.
+    if isinstance(markup, ReplyKeyboardMarkup):
+        await callback.message.answer(text, reply_markup=markup)
+        return
     try:
         await callback.message.edit_text(text, reply_markup=markup)
     except Exception:
@@ -453,8 +464,9 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "📖 <b>Добро пожаловать</b>\n\n"
         "Здесь можно читать заданный на сегодня отрывок Библии, "
-        "размышлять над ним и анонимно читать мысли других.",
-        reply_markup=main_keyboard(),
+        "размышлять над ним и анонимно читать мысли других.\n\n"
+        "Пользуйся кнопками в меню внизу экрана 👇",
+        reply_markup=main_keyboard(message.from_user.id),
     )
 
 
@@ -470,29 +482,36 @@ async def help_command(message: Message):
     )
 
 
-@dp.callback_query(F.data == "today")
-async def today_handler(callback: CallbackQuery):
-    await callback.answer()
+# ---- Общая логика экранов: используется и inline-кнопками (внутри сообщений),
+# ---- и постоянной клавиатурой меню внизу чата (KeyboardButton). ----
+
+async def send_today(target, user_id):
     reading = get_today_reading()
     if reading:
-        mark_reading_viewed(callback.from_user.id, reading["reading_date"])
+        mark_reading_viewed(user_id, reading["reading_date"])
     rows = []
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(text="✨ Открыть", web_app=WebAppInfo(url=WEBAPP_URL))])
     rows += [
         [InlineKeyboardButton(text="💭 Написать размышление", callback_data="write_reflection")],
         [InlineKeyboardButton(text="👥 Что думают другие", callback_data="others")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
     ]
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     messages = today_messages()
-    if len(messages) == 1:
-        await safe_edit(callback, messages[0], markup)
-        return
-    await safe_edit(callback, messages[0], None)
-    for chunk in messages[1:-1]:
-        await callback.message.answer(chunk)
-    await callback.message.answer(messages[-1], reply_markup=markup)
+    for chunk in messages[:-1]:
+        await target.answer(chunk)
+    await target.answer(messages[-1], reply_markup=markup)
+
+
+@dp.callback_query(F.data == "today")
+async def today_handler(callback: CallbackQuery):
+    await callback.answer()
+    await send_today(callback.message, callback.from_user.id)
+
+
+@dp.message(F.text == "📖 Сегодня", StateFilter(None))
+async def today_menu(message: Message):
+    await send_today(message, message.from_user.id)
 
 
 @dp.callback_query(F.data == "write_reflection")
@@ -602,61 +621,45 @@ async def notify_admins_about_reflection(bot: Bot, reflection_id: int):
             logging.exception("Could not notify admin %s", admin["telegram_id"])
 
 
-@dp.callback_query(F.data == "others")
-async def others_handler(callback: CallbackQuery):
-    await callback.answer()
-    reading = get_today_reading()
+async def send_others(target, reading):
+    """Каждое опубликованное размышление отправляется отдельным сообщением, а не одним общим текстом."""
     if not reading:
-        await safe_edit(callback, "Сегодняшнее чтение ещё не задано.", InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
-        ]))
+        await target.answer("Сегодняшнее чтение ещё не задано.")
         return
     rows = get_published_reflections(reading["id"])
     if not rows:
-        text = f"👥 <b>Что думают другие</b>\n\nПо теме «{escape(reading['title'])}» пока нет опубликованных размышлений."
-        await safe_edit(callback, text, InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")]]))
+        await target.answer(f"👥 <b>Что думают другие</b>\n\nПо теме «{escape(reading['title'])}» пока нет опубликованных размышлений.")
         return
-
-    # Keep each Telegram message below the platform limit while preserving full reflection text.
-    header = f"👥 <b>Что думают другие</b>\n\nОпубликовано размышлений: {len(rows)}\n"
-    chunks = []
-    current = header
-    for i, row in enumerate(rows[:10], 1):
-        block = f"\n<b>💭 Размышление {i}</b>\n{escape(row['text'])}\n"
-        if len(current) + len(block) > 3900 and current != header:
-            chunks.append(current)
-            current = ""
-        current += block
-    if current:
-        chunks.append(current)
-
-    await safe_edit(callback, chunks[0], None if len(chunks) > 1 else InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")]
-    ]))
-    for chunk in chunks[1:]:
-        await callback.message.answer(chunk)
-    if len(chunks) > 1:
-        await callback.message.answer("⬅️", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")]
-        ]))
+    await target.answer(f"👥 <b>Что думают другие</b>\n\nОпубликовано размышлений: {len(rows)}")
+    for i, row in enumerate(rows[:30], 1):
+        block = f"💭 <b>Размышление {i}</b>\n{escape(row['text'])}"
+        chunks = split_text(block)
+        for chunk in chunks:
+            await target.answer(chunk)
 
 
-@dp.callback_query(F.data == "my_reflection")
-async def my_reflection_handler(callback: CallbackQuery):
+@dp.callback_query(F.data == "others")
+async def others_handler(callback: CallbackQuery):
     await callback.answer()
+    await send_others(callback.message, get_today_reading())
+
+
+@dp.message(F.text == "👥 Что думают другие", StateFilter(None))
+async def others_menu(message: Message):
+    await send_others(message, get_today_reading())
+
+
+async def send_my_reflection(target, user_id):
     reading = get_today_reading()
     if not reading:
-        await safe_edit(callback, "Сегодняшнее чтение ещё не задано.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]))
+        await target.answer("Сегодняшнее чтение ещё не задано.")
         return
     conn = db()
-    row = conn.execute("SELECT * FROM reflections WHERE telegram_id=? AND reading_id=?", (callback.from_user.id, reading["id"])).fetchone()
+    row = conn.execute("SELECT * FROM reflections WHERE telegram_id=? AND reading_id=?", (user_id, reading["id"])).fetchone()
     conn.close()
     if not row:
         text = "💭 Сегодня ты ещё не отправлял размышление."
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✍️ Написать", callback_data="write_reflection")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")],
-        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✍️ Написать", callback_data="write_reflection")]])
     else:
         status = {"pending": "⏳ На модерации", "published": "✅ Опубликовано анонимно", "rejected": "❌ Отклонено"}.get(row["status"], row["status"])
         text = f"💭 <b>Твоё сегодняшнее размышление</b>\n\n{escape(row['text'])}\n\n<b>Статус:</b> {status}"
@@ -665,9 +668,19 @@ async def my_reflection_handler(callback: CallbackQuery):
             buttons.append([InlineKeyboardButton(text="✏️ Попросить изменить", callback_data=f"edit_request:{row['id']}")])
         elif row["status"] == "rejected":
             buttons.append([InlineKeyboardButton(text="✍️ Отправить заново", callback_data="write_reflection")])
-        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="home")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await safe_edit(callback, text, markup)
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await target.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "my_reflection")
+async def my_reflection_handler(callback: CallbackQuery):
+    await callback.answer()
+    await send_my_reflection(callback.message, callback.from_user.id)
+
+
+@dp.message(F.text == "💭 Моё размышление", StateFilter(None))
+async def my_reflection_menu(message: Message):
+    await send_my_reflection(message, message.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("edit_request:"))
@@ -737,18 +750,26 @@ async def edit_request_save(message: Message, state: FSMContext):
 
 # -------------------- History --------------------
 
-@dp.callback_query(F.data == "history")
-async def history_handler(callback: CallbackQuery):
-    await callback.answer()
+async def send_history_menu(target):
     conn = db()
     rows = conn.execute("SELECT * FROM history_events ORDER BY position, id").fetchall()
     conn.close()
     if not rows:
-        await safe_edit(callback, "📜 <b>Библия — это история</b>\n\nАдминистратор ещё не добавил события.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]))
+        await target.answer("📜 <b>Библия — это история</b>\n\nАдминистратор ещё не добавил события.")
         return
     buttons = [[InlineKeyboardButton(text=f"📜 {row['title']}", callback_data=f"hist:{row['id']}")] for row in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="home")])
-    await safe_edit(callback, "📜 <b>Библия — это история</b>\n\nВыбери событие:", InlineKeyboardMarkup(inline_keyboard=buttons))
+    await target.answer("📜 <b>Библия — это история</b>\n\nВыбери событие:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data == "history")
+async def history_handler(callback: CallbackQuery):
+    await callback.answer()
+    await send_history_menu(callback.message)
+
+
+@dp.message(F.text == "📜 История", StateFilter(None))
+async def history_menu(message: Message):
+    await send_history_menu(message)
 
 
 @dp.callback_query(F.data.startswith("hist:") & ~F.data.startswith("hist_add"))
@@ -770,22 +791,45 @@ async def history_event_handler(callback: CallbackQuery):
     ]))
 
 
+async def send_progress(target, user_id):
+    conn = db()
+    days = conn.execute("SELECT COUNT(*) FROM reading_views WHERE telegram_id=?", (user_id,)).fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM reflections WHERE telegram_id=?", (user_id,)).fetchone()[0]
+    published = conn.execute("SELECT COUNT(*) FROM reflections WHERE telegram_id=? AND status='published'", (user_id,)).fetchone()[0]
+    conn.close()
+    await target.answer(f"📊 <b>Мой прогресс</b>\n\n📖 Дней с открытым чтением: {days}\n💭 Размышлений отправлено: {total}\n🌍 Опубликовано: {published}")
+
+
 @dp.callback_query(F.data == "progress")
 async def progress_handler(callback: CallbackQuery):
     await callback.answer()
-    conn = db()
-    days = conn.execute("SELECT COUNT(*) FROM reading_views WHERE telegram_id=?", (callback.from_user.id,)).fetchone()[0]
-    total = conn.execute("SELECT COUNT(*) FROM reflections WHERE telegram_id=?", (callback.from_user.id,)).fetchone()[0]
-    published = conn.execute("SELECT COUNT(*) FROM reflections WHERE telegram_id=? AND status='published'", (callback.from_user.id,)).fetchone()[0]
-    conn.close()
-    await safe_edit(callback, f"📊 <b>Мой прогресс</b>\n\n📖 Дней с открытым чтением: {days}\n💭 Размышлений отправлено: {total}\n🌍 Опубликовано: {published}", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]))
+    await send_progress(callback.message, callback.from_user.id)
+
+
+@dp.message(F.text == "📊 Мой прогресс", StateFilter(None))
+async def progress_menu(message: Message):
+    await send_progress(message, message.from_user.id)
 
 
 @dp.callback_query(F.data == "home")
 async def home_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
-    await safe_edit(callback, "📖 <b>Главное меню</b>", main_keyboard())
+    await safe_edit(callback, "📖 <b>Главное меню</b>\n\nПользуйся кнопками в меню внизу экрана 👇", main_keyboard(callback.from_user.id))
+
+
+@dp.message(F.text == "⚙️ Админ-панель", StateFilter(None))
+async def admin_panel_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer("⚙️ <b>Панель администратора</b>\n\nПользуйся кнопками в меню внизу экрана 👇", reply_markup=admin_menu_for(message.from_user.id))
+
+
+@dp.message(F.text == "⬅️ В главное меню", StateFilter(None))
+async def back_to_main_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📖 <b>Главное меню</b>\n\nПользуйся кнопками в меню внизу экрана 👇", reply_markup=main_keyboard(message.from_user.id))
 
 
 # -------------------- Admin: reading --------------------
@@ -798,27 +842,38 @@ async def admin_command(message: Message):
     await message.answer("⚙️ <b>Панель администратора</b>", reply_markup=admin_menu_for(message.from_user.id))
 
 
-@dp.callback_query(F.data == "adm_today")
-async def adm_today(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    await callback.answer()
+async def send_adm_today(target):
     text = (
         "📖 <b>Управление чтением</b>\n\n"
         + reading_summary(get_reading_by_date(today()), f"Сегодня, {today()}")
         + "\n\n"
         + reading_summary(get_reading_by_date(tomorrow()), f"Завтра, {tomorrow()}")
     )
-    await callback.message.answer(
+    await target.answer(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Задать на сегодня", callback_data="set_day:today")],
             [InlineKeyboardButton(text="🗓 Задать на завтра", callback_data="set_day:tomorrow")],
             [InlineKeyboardButton(text="🔔 Разослать сегодняшнее сейчас", callback_data="notify_now")],
-            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin_home")],
         ])
     )
+
+
+@dp.callback_query(F.data == "adm_today")
+async def adm_today(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await send_adm_today(callback.message)
+
+
+@dp.message(F.text == "📖 Управление чтением", StateFilter(None))
+async def adm_today_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await send_adm_today(message)
 
 
 @dp.callback_query(F.data.in_({"set_today", "set_day:today", "set_day:tomorrow"}))
@@ -966,17 +1021,12 @@ async def admin_question(message: Message, state: FSMContext):
 
 # -------------------- Admin: moderation --------------------
 
-@dp.callback_query(F.data == "adm_moderation")
-async def adm_moderation(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    await callback.answer()
+async def send_adm_moderation(target):
     rows = get_pending_reflections()
     if not rows:
-        await callback.message.answer("🛡 На модерации ничего нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin_home")]]))
+        await target.answer("🛡 На модерации ничего нет.")
         return
-    await callback.message.answer(f"🛡 На модерации: {len(rows)}")
+    await target.answer(f"🛡 На модерации: {len(rows)}")
     for row in rows:
         header = (
             f"📝 <b>Размышление #{row['id']}</b>\n\n"
@@ -989,10 +1039,27 @@ async def adm_moderation(callback: CallbackQuery):
             InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"approve:{row['id']}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{row['id']}"),
         ]])
-        await callback.message.answer(header)
+        await target.answer(header)
         chunks = split_text(body)
         for i, chunk in enumerate(chunks):
-            await callback.message.answer(chunk, reply_markup=markup if i == len(chunks) - 1 else None)
+            await target.answer(chunk, reply_markup=markup if i == len(chunks) - 1 else None)
+
+
+@dp.callback_query(F.data == "adm_moderation")
+async def adm_moderation(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await send_adm_moderation(callback.message)
+
+
+@dp.message(F.text == "🛡 Модерация", StateFilter(None))
+async def adm_moderation_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await send_adm_moderation(message)
 
 
 @dp.callback_query(F.data.startswith("approve:"))
@@ -1057,17 +1124,28 @@ async def reject(callback: CallbackQuery):
 
 # -------------------- Admin: history --------------------
 
+async def send_adm_history(target):
+    await target.answer("📜 <b>Библия — это история</b>\n\nДобавляй события вручную. Бот ничего сам не придумывает.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить событие", callback_data="hist_add")],
+        [InlineKeyboardButton(text="📋 Управление событиями", callback_data="hist_list")],
+    ]))
+
+
 @dp.callback_query(F.data == "adm_history")
 async def adm_history(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
     await callback.answer()
-    await callback.message.answer("📜 <b>Библия — это история</b>\n\nДобавляй события вручную. Бот ничего сам не придумывает.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить событие", callback_data="hist_add")],
-        [InlineKeyboardButton(text="📋 Управление событиями", callback_data="hist_list")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin_home")],
-    ]))
+    await send_adm_history(callback.message)
+
+
+@dp.message(F.text == "📜 Управление историей", StateFilter(None))
+async def adm_history_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await send_adm_history(message)
 
 
 @dp.callback_query(F.data == "hist_add")
@@ -1215,12 +1293,7 @@ async def hist_del(callback: CallbackQuery):
 
 # -------------------- Admin: stats/admins --------------------
 
-@dp.callback_query(F.data == "adm_stats")
-async def adm_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    await callback.answer()
+async def send_adm_stats(target):
     conn = db()
     users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     reflections = conn.execute("SELECT COUNT(*) FROM reflections").fetchone()[0]
@@ -1228,7 +1301,38 @@ async def adm_stats(callback: CallbackQuery):
     published = conn.execute("SELECT COUNT(*) FROM reflections WHERE status='published'").fetchone()[0]
     readings = conn.execute("SELECT COUNT(*) FROM daily_reading").fetchone()[0]
     conn.close()
-    await callback.message.answer(f"📊 <b>Статистика</b>\n\n👥 Пользователей: {users}\n📖 Дней чтения задано: {readings}\n💭 Размышлений: {reflections}\n⏳ На модерации: {pending}\n🌍 Опубликовано: {published}")
+    await target.answer(f"📊 <b>Статистика</b>\n\n👥 Пользователей: {users}\n📖 Дней чтения задано: {readings}\n💭 Размышлений: {reflections}\n⏳ На модерации: {pending}\n🌍 Опубликовано: {published}")
+
+
+@dp.callback_query(F.data == "adm_stats")
+async def adm_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await send_adm_stats(callback.message)
+
+
+@dp.message(F.text == "📊 Статистика бота", StateFilter(None))
+async def adm_stats_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await send_adm_stats(message)
+
+
+async def send_adm_admins(target):
+    conn = db()
+    rows = conn.execute("SELECT telegram_id, added_at FROM admins ORDER BY added_at").fetchall()
+    conn.close()
+    text = "👑 <b>Администраторы</b>\n\n"
+    for r in rows:
+        role = "Главный администратор" if r["telegram_id"] == OWNER_ID else "Дополнительный администратор"
+        text += f"• <code>{r['telegram_id']}</code> — {role}\n"
+    await target.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add")],
+        [InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_remove")],
+    ]))
 
 
 @dp.callback_query(F.data == "adm_admins")
@@ -1237,18 +1341,15 @@ async def adm_admins(callback: CallbackQuery):
         await callback.answer("Только главный администратор.", show_alert=True)
         return
     await callback.answer()
-    conn = db()
-    rows = conn.execute("SELECT telegram_id, added_at FROM admins ORDER BY added_at").fetchall()
-    conn.close()
-    text = "👑 <b>Администраторы</b>\n\n"
-    for r in rows:
-        role = "Главный администратор" if r["telegram_id"] == OWNER_ID else "Дополнительный администратор"
-        text += f"• <code>{r['telegram_id']}</code> — {role}\n"
-    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add")],
-        [InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_remove")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="admin_home")],
-    ]))
+    await send_adm_admins(callback.message)
+
+
+@dp.message(F.text == "👑 Администраторы", StateFilter(None))
+async def adm_admins_menu(message: Message):
+    if not is_owner(message.from_user.id):
+        await message.answer("Только главный администратор.")
+        return
+    await send_adm_admins(message)
 
 
 @dp.callback_query(F.data == "admin_add")
